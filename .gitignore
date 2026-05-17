@@ -4,3 +4,7 @@ __pycache__/
 .venv/
 venv/
 .env
+
+# nsys profiling outputs
+profile_*.nsys-rep
+profile_*.sqlite

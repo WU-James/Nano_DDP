@@ -8,19 +8,31 @@
 #   No BatchNorm / module buffer sync in this skeleton (use SyncBatchNorm outside if needed).
 #
 # Classes:
-#   NanoDDPPathA — post-backward: flatten -> all_reduce -> unflatten (call sync_gradients()).
-#   NanoDDPPathB — backward hooks on AccumulateGrad (closer to official DDP).
+#   NanoDDPV1 — post-backward: flatten -> all_reduce -> unflatten (call sync_gradients()).
+#   NanoDDPV2 — backward hooks on AccumulateGrad (closer to official DDP).
+#   NanoDDPV3 — V2 + gradient buckets: all_reduce only when a bucket is full (default 25 MiB).
 #   NanoDDP — umbrella: both path stubs in one file; implement only one strategy.
 #
-# Path A training loop (NanoDDPPathA registers register_full_backward_hook → auto sync_gradients):
-#   model = NanoDDPPathA(raw_model, device=...)
+# V1 training loop (NanoDDPV1 registers register_full_backward_hook → auto sync_gradients):
+#   model = NanoDDPV1(raw_model, device=...)
 #   loss.backward()   # ends with in-place sync all_reduce over flattened grads; no finalize_backward needed
 #   optimizer.step()
 #   Call model.sync_gradients() manually only if you disable the hook (not default).
 #
-# Path B: implement hooks, then optimizer.step() after backward (+ finalize if async).
+# V2 training loop (register_full_backward_hook → auto finalize_backward):
+#   model = NanoDDPV2(raw_model, device=...)
+#   loss.backward()   # per-param async all_reduce during backward; hook waits and averages
+#   optimizer.step()
+#   Call model.finalize_backward() manually only if you disable the hook (not default).
+#
+# V3 training loop (same as V2, but grads are bucketed before all_reduce):
+#   model = NanoDDPV3(raw_model, device=..., bucket_size_bytes=25 * 1024 * 1024)
+#   loss.backward()   # flush full buckets during backward; finalize flushes the tail bucket
+#   optimizer.step()
 
 from __future__ import annotations
+
+import functools
 
 import torch
 import torch.distributed as dist
@@ -88,8 +100,8 @@ class _NanoDDPBase(Module):
     #     ...
 
 
-class NanoDDPPathA(_NanoDDPBase):
-    """Path A: after full backward on ``module``, flatten → sync all_reduce(SUM) → / world_size → unflatten.
+class NanoDDPV1(_NanoDDPBase):
+    """V1: after full backward on ``module``, flatten → sync all_reduce(SUM) → / world_size → unflatten.
 
     Uses ``register_full_backward_hook`` so ``sync_gradients()`` runs automatically; no ``finalize_backward`` needed
     for the default synchronous ``dist.all_reduce`` (async_op=False).
@@ -132,7 +144,7 @@ class NanoDDPPathA(_NanoDDPBase):
             g = param.grad
             if g is None:
                 raise RuntimeError(
-                    "NanoDDPPathA: expected every managed parameter to have .grad after backward; "
+                    "NanoDDPV1: expected every managed parameter to have .grad after backward; "
                     f"got None for {param_name!r}."
                 )
             chunks.append(g.detach().reshape(-1))
@@ -148,8 +160,11 @@ class NanoDDPPathA(_NanoDDPBase):
             offset += n
 
 
-class NanoDDPPathB(_NanoDDPBase):
-    """Path B only: register_gradient_accumulator_hooks; all_reduce during backward."""
+class NanoDDPV2(_NanoDDPBase):
+    """V2: per-parameter AccumulateGrad hooks (async all_reduce) + ``finalize_backward`` after backward.
+
+    Uses ``register_full_backward_hook`` so ``finalize_backward()`` runs automatically; manual call is optional.
+    """
 
     def __init__(
         self,
@@ -160,125 +175,202 @@ class NanoDDPPathB(_NanoDDPBase):
     ) -> None:
         super().__init__(module, device=device, process_group=process_group)
         self._grad_hook_handles: list = []
-        # Append ``Work`` from ``dist.all_reduce(..., async_op=True)``; consumed in ``finalize_backward``.
-        self._pending_works: list = []
+        # (Work, reduced buffer, param_index, writeback): consumed in ``finalize_backward``.
+        self._pending_grad_syncs: list[
+            tuple[dist.Work, torch.Tensor, int, bool]
+        ] = []
 
-        # TODO: after implementing _register_gradient_accumulator_hooks, uncomment:
-        # self._register_gradient_accumulator_hooks()
+        self._register_gradient_accumulator_hooks()
+        self._full_backward_hook_handle = self.module.register_full_backward_hook(
+            self._post_backward_finalize
+        )
+
+    def _post_backward_finalize(
+        self,
+        module: Module,
+        grad_input: tuple[torch.Tensor | None, ...],
+        grad_output: tuple[torch.Tensor | None, ...],
+    ) -> None:
+        del module, grad_input, grad_output
+        self.finalize_backward()
 
     def _register_gradient_accumulator_hooks(self) -> None:
-        """TODO: For each index idx and (param_name, p) in self._managed_params:
-
-        tmp = p.expand_as(p)
-        grad_acc = tmp.grad_fn.next_functions[0][0]
-        h = grad_acc.register_hook(functools.partial(self._on_gradient_accumulator_ready, idx))
-
-        Append h to self._grad_hook_handles. Import functools in this file when you fill this in.
-
-        Do not also run Path A sync_gradients on the same step.
+        """For each managed parameter, hook its AccumulateGrad node.
         """
-        ...
+        for idx, (_param_name, param) in enumerate(self._managed_params):
+            tmp = param.expand_as(param)
+            grad_acc = tmp.grad_fn.next_functions[0][0]
+            h = grad_acc.register_hook(
+                functools.partial(self._on_gradient_accumulator_ready, idx)
+            )
+            self._grad_hook_handles.append(h)
 
     def _on_gradient_accumulator_ready(
         self, param_index: int, grad: torch.Tensor | None
     ) -> torch.Tensor | None:
-        """TODO: Invoked when this parameter's grad has been computed for the current backward.
+        """Invoked when this parameter's grad has been computed for the current backward.
 
-        Typical: dist.all_reduce(grad, ...); grad.div_(world_size); return grad.
+        grad may be None for unused parameters on this step — run a zero all_reduce to
+        align collectives across ranks, then return None.
 
-        grad may be None for unused parameters on this step — align collectives across ranks or restrict models.
-
-        Return None to leave .grad as computed; return a Tensor to replace the gradient for this parameter.
+        Reduce runs on a detached buffer so autograd does not traverse c10d collectives.
         """
-        ...
+        _, param = self._managed_params[param_index]
+        if grad is None:
+            buf = torch.zeros_like(param)
+            writeback = False
+        else:
+            buf = grad.detach().clone()
+            writeback = True
+
+        work = dist.all_reduce(
+            buf,
+            op=dist.ReduceOp.SUM,
+            group=self.process_group,
+            async_op=True,
+        )
+        self._pending_grad_syncs.append((work, buf, param_index, writeback))
+        return grad
 
     def finalize_backward(self) -> None:
-        """Wait on async collectives in ``_pending_works``; call after ``backward()`` if hooks use ``async_op=True``."""
-        for work in self._pending_works:
+        """Wait on async collectives; average reduced buffers and write to ``param.grad``.
+
+        Called automatically via full backward hook; safe to call again (no-op if nothing pending).
+        """
+        for work, _buf, _param_index, _writeback in self._pending_grad_syncs:
             work.wait()
-        self._pending_works.clear()
+        pending = self._pending_grad_syncs
+        self._pending_grad_syncs = []
+        for _work, buf, param_index, writeback in pending:
+            if not writeback:
+                continue
+            buf.div_(self._world_size)
+            _, param = self._managed_params[param_index]
+            if param.grad is None:
+                param.grad = buf
+            else:
+                param.grad.copy_(buf)
 
 
-# class NanoDDP(_NanoDDPBase):
-#     """Umbrella teaching class: Path A + Path B methods together; fill in only one path.
-
-#     Same layout as before the split — convenient for a single file of TODOs.
-#     """
-
-#     def __init__(
-#         self,
-#         module: Module,
-#         *,
-#         device: torch.device,
-#         process_group: dist.ProcessGroup | None = None,
-#     ) -> None:
-#         super().__init__(module, device=device, process_group=process_group)
-#         self._grad_hook_handles: list = []
-#         self._pending_works: list = []
-
-#         # Path B (optional): implement _register_gradient_accumulator_hooks first, then uncomment:
-#         # self._register_gradient_accumulator_hooks()
-
-#     # ----- Path A (post-backward flat sync) -----
-
-#     def sync_gradients(self) -> None:
-#         """TODO: flat = _flatten_managed_grads(); _all_reduce_maybe_async(flat);
-#         after reduce completes: divide flat by world_size and write back into each p.grad
-#         (_unflatten_grads_into_parameters), unless you folded divide/write into helpers.
-
-#         For fully synchronous dist.all_reduce, you can skip _pending_works and finalize_backward.
-#         If you implement Path B hooks with all_reduce, leave this as no-op or only wait().
-#         """
-#         ...
-
-#     def _flatten_managed_grads(self) -> torch.Tensor:
-#         """TODO: One 1-D tensor containing all managed gradients (e.g. torch.cat). Handle None grads."""
-#         ...
-
-#     def _all_reduce_maybe_async(self, tensor: torch.Tensor) -> None:
-#         """TODO: dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=..., async_op=...).
-
-#         If async_op=True, append returned Work to self._pending_works.
-#         """
-#         ...
-
-#     def _unflatten_grads_into_parameters(self, flat: torch.Tensor) -> None:
-#         """TODO: After flat has been summed across ranks and divided by world_size, scatter slices back to param.grad."""
-#         ...
-
-#     def finalize_backward(self) -> None:
-#         """Path B / async: ``work.wait()`` on ``_pending_works``. Path A-only users can ignore."""
-#         for work in self._pending_works:
-#             work.wait()
-#         self._pending_works.clear()
-
-#     # ----- Path B (backward hooks) -----
-
-#     def _register_gradient_accumulator_hooks(self) -> None:
-#         """TODO: For each index idx and (param_name, p) in self._managed_params:
-
-#         tmp = p.expand_as(p)
-#         grad_acc = tmp.grad_fn.next_functions[0][0]
-#         h = grad_acc.register_hook(functools.partial(self._on_gradient_accumulator_ready, idx))
-
-#         Append h to self._grad_hook_handles. Import functools in this file when you fill this in.
-
-#         Do not double-reduce: if you hook-drive all_reduce, leave sync_gradients() as no-op or only wait().
-#         """
-#         ...
-
-#     def _on_gradient_accumulator_ready(
-#         self, param_index: int, grad: torch.Tensor | None
-#     ) -> torch.Tensor | None:
-#         """TODO: Invoked when this parameter's grad has been computed for the current backward.
-
-#         grad may be None for unused parameters on this step — align collectives across ranks or restrict models.
-
-#         Return None to leave .grad as computed; return a Tensor to replace the gradient for this parameter.
-#         """
-#         ...
+_DEFAULT_BUCKET_SIZE_BYTES = 25 * 1024 * 1024
 
 
-# def setup_process_group_stub() -> None:
-#     """TODO (outside class): init_process_group, set_device — keep in your train script."""
-#     ...
+class NanoDDPV3(_NanoDDPBase):
+    """V3: V2-style AccumulateGrad hooks, but batch grads into byte-limited buckets before all_reduce.
+
+    Parameters are appended to the open bucket as their grads become ready during backward.
+    When the next parameter would exceed ``bucket_size_bytes``, the current bucket is flattened,
+    all_reduced asynchronously, and a new bucket starts. ``finalize_backward`` flushes any
+    remainder and writes averaged grads back to parameters.
+    """
+
+    def __init__(
+        self,
+        module: Module,
+        *,
+        device: torch.device,
+        process_group: dist.ProcessGroup | None = None,
+        bucket_size_bytes: int = _DEFAULT_BUCKET_SIZE_BYTES,
+    ) -> None:
+        if bucket_size_bytes <= 0:
+            raise ValueError("bucket_size_bytes must be positive.")
+        super().__init__(module, device=device, process_group=process_group)
+        self._bucket_size_bytes = bucket_size_bytes
+        self._grad_hook_handles: list = []
+        # Open bucket: (param_index, detached grad buffer, writeback).
+        self._open_bucket: list[tuple[int, torch.Tensor, bool]] = []
+        self._open_bucket_nbytes: int = 0
+        # (Work, flat reduced buffer, unflatten metadata).
+        self._pending_bucket_syncs: list[
+            tuple[dist.Work, torch.Tensor, list[tuple[int, int, int, bool]]]
+        ] = []
+
+        self._register_gradient_accumulator_hooks()
+        self._full_backward_hook_handle = self.module.register_full_backward_hook(
+            self._post_backward_finalize
+        )
+
+    def _post_backward_finalize(
+        self,
+        module: Module,
+        grad_input: tuple[torch.Tensor | None, ...],
+        grad_output: tuple[torch.Tensor | None, ...],
+    ) -> None:
+        del module, grad_input, grad_output
+        self.finalize_backward()
+
+    def _register_gradient_accumulator_hooks(self) -> None:
+        for idx, (_param_name, param) in enumerate(self._managed_params):
+            tmp = param.expand_as(param)
+            grad_acc = tmp.grad_fn.next_functions[0][0]
+            h = grad_acc.register_hook(
+                functools.partial(self._on_gradient_accumulator_ready, idx)
+            )
+            self._grad_hook_handles.append(h)
+
+    def _on_gradient_accumulator_ready(
+        self, param_index: int, grad: torch.Tensor | None
+    ) -> torch.Tensor | None:
+        _, param = self._managed_params[param_index]
+        if grad is None:
+            buf = torch.zeros_like(param)
+            writeback = False
+        else:
+            buf = grad.detach().clone()
+            writeback = True
+
+        param_nbytes = buf.numel() * buf.element_size()
+        if (
+            self._open_bucket
+            and self._open_bucket_nbytes + param_nbytes > self._bucket_size_bytes
+        ):
+            self._flush_open_bucket()
+
+        self._open_bucket.append((param_index, buf, writeback))
+        self._open_bucket_nbytes += param_nbytes
+        return grad
+
+    def _flush_open_bucket(self) -> None:
+        if not self._open_bucket:
+            return
+
+        flat = torch.cat(
+            [buf.reshape(-1) for _param_index, buf, _writeback in self._open_bucket],
+            dim=0,
+        )
+        work = dist.all_reduce(
+            flat,
+            op=dist.ReduceOp.SUM,
+            group=self.process_group,
+            async_op=True,
+        )
+        meta: list[tuple[int, int, int, bool]] = []
+        offset = 0
+        for param_index, buf, writeback in self._open_bucket:
+            n = buf.numel()
+            meta.append((param_index, offset, n, writeback))
+            offset += n
+        self._pending_bucket_syncs.append((work, flat, meta))
+        self._open_bucket = []
+        self._open_bucket_nbytes = 0
+
+    def finalize_backward(self) -> None:
+        """Flush tail bucket, wait on bucket collectives, average and write ``param.grad``."""
+        self._flush_open_bucket()
+        for work, _flat, _meta in self._pending_bucket_syncs:
+            work.wait()
+        pending = self._pending_bucket_syncs
+        self._pending_bucket_syncs = []
+        for _work, flat, meta in pending:
+            flat.div_(self._world_size)
+            for param_index, offset, n, writeback in meta:
+                if not writeback:
+                    continue
+                chunk = flat[offset : offset + n]
+                _, param = self._managed_params[param_index]
+                averaged = chunk.view_as(param)
+                if param.grad is None:
+                    param.grad = averaged.clone()
+                else:
+                    param.grad.copy_(averaged)
+
