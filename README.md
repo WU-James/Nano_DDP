@@ -9,6 +9,14 @@ Besides, to compare the efficiency of my own implementation of **Nano DDP** with
 - Nano DDP demo: [`run_nano_ddp.py`](run_nano_ddp.py) (`--path v1|v2|v3`)
 - Official DDP demo: [`run_ddp.py`](run_ddp.py)
 
+
+## Differences among Nano DDP V1/V2/V3
+
+- **V1:** Wait until backward finishes for every parameter, then `all_reduce` once on flattened grads.
+- **V2:** `all_reduce` each parameter’s gradient as soon as it’s ready during backward.
+- **V3:** Pack parameters into byte-sized buckets and `all_reduce` when a bucket fills up — closest to official DDP.
+
+
 ## Requirements
 
 - Python 3.10+
@@ -66,12 +74,6 @@ torchrun --standalone --nproc_per_node=2 run_nano_ddp.py --path v2 --global-batc
 ```
 
 
-
-## Differences among the three Nano DDP variants
-
-- **V1:** Wait until backward finishes for every parameter, then `all_reduce` once on flattened grads.
-- **V2:** `all_reduce` each parameter’s gradient as soon as it’s ready during backward.
-- **V3:** Pack parameters into byte-sized buckets and `all_reduce` when a bucket fills up — closest to official DDP.
 
 ## Profiling with Nsight Systems
 
