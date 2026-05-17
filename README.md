@@ -1,4 +1,7 @@
-# Nano DDP
+# Nano DDP - CSIT 5970 Project
+
+Name: Wu Yongjin
+SID: 20564741
 
 This project is for **implementing Data Parallel LLM distributed training** by myself. The repo provides three incremental implementations (**NanoDDP V1 / V2 / V3**) in:
 
@@ -64,14 +67,6 @@ Besides `--path`, you can use the following CLI arguments for profiling under di
 | `--nvtx` | off | Wrap `loss.backward()` in NVTX range `backward` for Nsight Systems |
 
 
-
-Examples:
-
-```bash
-torchrun --standalone --nproc_per_node=2 run_ddp.py --global-batch-size 32 --warmup-steps 20 --max-steps 100
-
-torchrun --standalone --nproc_per_node=2 run_nano_ddp.py --path v2 --global-batch-size 32 --warmup-steps 20 --max-steps 100
-```
 
 
 

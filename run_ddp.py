@@ -1,18 +1,3 @@
-# Demo: fine-tune BERT on GLUE MRPC with standard PyTorch DistributedDataParallel.
-#
-#   pip install transformers datasets  # if not already
-#
-# Single node, 2 GPUs (change 2 to your GPU count):
-#   torchrun --standalone --nproc_per_node=2 run_ddp.py
-#   torchrun --standalone --nproc_per_node=2 run_ddp.py --global-batch-size 32
-#   torchrun --standalone --nproc_per_node=2 run_ddp.py --warmup-steps 20 --max-steps 100
-#
-# nsys (short run + NVTX on backward):
-#   nsys profile -o profile_ddp --force-overwrite=true --trace=cuda,nccl,nvtx \
-#     --capture-range=nvtx --nvtx-capture="backward" \
-#     torchrun --standalone --nproc_per_node=2 run_ddp.py --nvtx \
-#       --warmup-steps 2 --max-steps 5
-
 from __future__ import annotations
 
 import argparse

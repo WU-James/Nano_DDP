@@ -1,34 +1,3 @@
-# Teaching skeleton: single-machine multi-process DDP-style wrapper (gradients only).
-# Fill in the bodies marked TODO. This copy lives in nano_ddp/ (standalone from PyTorch agent_space).
-#
-# Prerequisites (outside this file):
-#   torch.distributed.init_process_group(...)
-#   torch.cuda.set_device(local_rank)  # per process
-#   Place module on self.device before wrapping (same as official DDP).
-#   No BatchNorm / module buffer sync in this skeleton (use SyncBatchNorm outside if needed).
-#
-# Classes:
-#   NanoDDPV1 — post-backward: flatten -> all_reduce -> unflatten (call sync_gradients()).
-#   NanoDDPV2 — post_accumulate_grad_hook per param + multi_grad finalize (closer to official DDP).
-#   NanoDDPV3 — V2 + gradient buckets: all_reduce only when a bucket is full (default 25 MiB).
-#   NanoDDP — umbrella: both path stubs in one file; implement only one strategy.
-#
-# V1 training loop (register_multi_grad_hook on managed params → auto sync_gradients):
-#   model = NanoDDPV1(raw_model, device=...)
-#   loss.backward()   # ends with in-place sync all_reduce over flattened grads; no finalize_backward needed
-#   optimizer.step()
-#   Call model.sync_gradients() manually only if you disable the hook (not default).
-#
-# V2 training loop (post_accumulate_grad_hook per param + register_multi_grad_hook finalize):
-#   model = NanoDDPV2(raw_model, device=...)
-#   loss.backward()   # per-param async all_reduce during backward; finalize waits and averages
-#   optimizer.step()
-#
-# V3 training loop (same hooks as V2, but grads are bucketed before all_reduce):
-#   model = NanoDDPV3(raw_model, device=..., bucket_size_bytes=25 * 1024 * 1024)
-#   loss.backward()   # flush full buckets during backward; finalize flushes the tail bucket
-#   optimizer.step()
-
 from __future__ import annotations
 
 import functools
@@ -119,24 +88,9 @@ class _NanoDDPBase(Module):
             )
         )
 
-    # def _allreduce_unused_params_placeholder(self) -> None:
-    #     """TODO: If some ranks omit parameters from the graph, plain all_reduce can deadlock.
-
-    #     Restrict models or add zeros/masks like official Reducer.
-    #     """
-    #     ...
-
-    # def _assert_same_control_flow(self) -> None:
-    #     """TODO: Debug: collective order matches on every rank."""
-    #     ...
-
 
 class NanoDDPV1(_NanoDDPBase):
-    """V1: after all parameter grads are ready, flatten → sync all_reduce(SUM) → / world_size → unflatten.
-
-    Uses ``torch.autograd.graph.register_multi_grad_hook`` on managed parameters so
-    ``sync_gradients()`` runs after backward even when the inner module returns a
-    Hugging Face ``ModelOutput`` (``register_full_backward_hook`` would not fire).
+    """V1: all reduce all params after whole backward is finished
     """
 
     def __init__(
@@ -167,9 +121,6 @@ class NanoDDPV1(_NanoDDPBase):
         self, grads: tuple[torch.Tensor | None, ...] | None = None
     ) -> None:
         """Flatten grads, all_reduce, average, write back to ``param.grad``.
-
-        When called from ``register_multi_grad_hook``, pass the hook's ``grads`` tuple:
-        ``param.grad`` may not be populated yet at callback time.
         """
         flat = (
             self._flatten_grad_tensors(grads)
@@ -220,10 +171,7 @@ class NanoDDPV1(_NanoDDPBase):
 
 
 class NanoDDPV2(_NanoDDPBase):
-    """V2: per-parameter post-accumulate hooks (async all_reduce) + ``finalize_backward`` after backward.
-
-    Uses ``register_post_accumulate_grad_hook`` (real backward graph) and
-    ``register_multi_grad_hook`` to call ``finalize_backward`` (works with HF ``ModelOutput``).
+    """V2: all reduce when the grad of each param is ready
     """
 
     def __init__(
@@ -251,8 +199,6 @@ class NanoDDPV2(_NanoDDPBase):
         self, param_index: int, grad: torch.Tensor
     ) -> torch.Tensor:
         """Invoked when this parameter's grad has been accumulated for the current backward.
-
-        Reduce runs on a detached buffer so autograd does not traverse c10d collectives.
         """
         _, param = self._managed_params[param_index]
         buf = grad.detach().clone()
@@ -267,8 +213,6 @@ class NanoDDPV2(_NanoDDPBase):
 
     def finalize_backward(self) -> None:
         """Wait on async collectives; average reduced buffers and write to ``param.grad``.
-
-        Called automatically via register_multi_grad_hook; safe to call again (no-op if nothing pending).
         """
         for work, _buf, _param_index, _writeback in self._pending_grad_syncs:
             work.wait()
@@ -289,12 +233,7 @@ _DEFAULT_BUCKET_SIZE_BYTES = 50 * 1024 * 1024
 
 
 class NanoDDPV3(_NanoDDPBase):
-    """V3: V2-style post-accumulate hooks, but batch grads into byte-limited buckets before all_reduce.
-
-    Parameters are appended to the open bucket as their grads become ready during backward.
-    When the next parameter would exceed ``bucket_size_bytes``, the current bucket is flattened,
-    all_reduced asynchronously, and a new bucket starts. ``finalize_backward`` flushes any
-    remainder and writes averaged grads back to parameters.
+    """V3: similar to V3, but all reduce when the backet is full
     """
 
     def __init__(

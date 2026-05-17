@@ -1,26 +1,3 @@
-# Demo: fine-tune BERT on GLUE MRPC with NanoDDPV1, NanoDDPV2, or NanoDDPV3 (nano_ddp.py).
-#
-# Put this file next to nano_ddp.py (same directory), then:
-#
-#   pip install transformers datasets  # if not already
-#
-# Single node, 2 GPUs (change 2 to your GPU count):
-#   torchrun --standalone --nproc_per_node=2 run_bert_nano_ddp_patha_demo.py
-#   torchrun --standalone --nproc_per_node=2 run_nano_ddp.py --path v2
-#   torchrun --standalone --nproc_per_node=2 run_nano_ddp.py --path v3
-#   torchrun --standalone --nproc_per_node=2 run_nano_ddp.py --path v1 --global-batch-size 32
-#   torchrun --standalone --nproc_per_node=2 run_nano_ddp.py --warmup-steps 20 --max-steps 100
-#
-# nsys (short run + NVTX on backward):
-#   nsys profile -o profile_v1 --force-overwrite=true --trace=cuda,nccl,nvtx \
-#     --capture-range=nvtx --nvtx-capture="backward" \
-#     torchrun --standalone --nproc_per_node=2 run_nano_ddp.py --path v1 --nvtx \
-#       --warmup-steps 2 --max-steps 5
-#
-# Copy to server (paths adjusted):
-#   scp /Users/james/git/nano_ddp/nano_ddp.py /Users/james/git/nano_ddp/run_bert_nano_ddp_patha_demo.py user@host:~/nano_ddp/
-#   ssh user@host 'cd ~/nano_ddp && torchrun --standalone --nproc_per_node=2 run_bert_nano_ddp_patha_demo.py --path v1'
-
 from __future__ import annotations
 
 import argparse
