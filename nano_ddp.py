@@ -13,7 +13,7 @@
 #   NanoDDPV3 — V2 + gradient buckets: all_reduce only when a bucket is full (default 25 MiB).
 #   NanoDDP — umbrella: both path stubs in one file; implement only one strategy.
 #
-# V1 training loop (NanoDDPV1 registers register_full_backward_hook → auto sync_gradients):
+# V1 training loop (register_multi_grad_hook on managed params → auto sync_gradients):
 #   model = NanoDDPV1(raw_model, device=...)
 #   loss.backward()   # ends with in-place sync all_reduce over flattened grads; no finalize_backward needed
 #   optimizer.step()
@@ -101,10 +101,11 @@ class _NanoDDPBase(Module):
 
 
 class NanoDDPV1(_NanoDDPBase):
-    """V1: after full backward on ``module``, flatten → sync all_reduce(SUM) → / world_size → unflatten.
+    """V1: after all parameter grads are ready, flatten → sync all_reduce(SUM) → / world_size → unflatten.
 
-    Uses ``register_full_backward_hook`` so ``sync_gradients()`` runs automatically; no ``finalize_backward`` needed
-    for the default synchronous ``dist.all_reduce`` (async_op=False).
+    Uses ``torch.autograd.graph.register_multi_grad_hook`` on managed parameters so
+    ``sync_gradients()`` runs after backward even when the inner module returns a
+    Hugging Face ``ModelOutput`` (``register_full_backward_hook`` would not fire).
     """
 
     def __init__(
@@ -116,35 +117,59 @@ class NanoDDPV1(_NanoDDPBase):
     ) -> None:
         super().__init__(module, device=device, process_group=process_group)
 
-        # Register full backward hook to trigger sync_gradients after backward.
-        self._full_backward_hook_handle = self.module.register_full_backward_hook(
-            self._post_backward_sync
+        params = [param for _name, param in self._managed_params]
+        self._multi_grad_hook_handle = torch.autograd.graph.register_multi_grad_hook(
+            params, self._on_all_grads_accumulated
         )
 
-    def _post_backward_sync(
-        self,
-        module: Module,
-        grad_input: tuple[torch.Tensor | None, ...],
-        grad_output: tuple[torch.Tensor | None, ...],
+    def _on_all_grads_accumulated(
+        self, grads: tuple[torch.Tensor | None, ...]
     ) -> None:
-        del module, grad_input, grad_output
-        self.sync_gradients()
+        if len(grads) != len(self._managed_params):
+            raise RuntimeError(
+                "NanoDDPV1: grad hook length mismatch with managed parameters "
+                f"({len(grads)} vs {len(self._managed_params)})."
+            )
+        self.sync_gradients(grads)
 
-    def sync_gradients(self) -> None:
-        """Flatten managed grads, all_reduce, write back to ``param.grad``."""
-        flat = self._flatten_managed_grads()
+    def sync_gradients(
+        self, grads: tuple[torch.Tensor | None, ...] | None = None
+    ) -> None:
+        """Flatten grads, all_reduce, average, write back to ``param.grad``.
+
+        When called from ``register_multi_grad_hook``, pass the hook's ``grads`` tuple:
+        ``param.grad`` may not be populated yet at callback time.
+        """
+        flat = (
+            self._flatten_grad_tensors(grads)
+            if grads is not None
+            else self._flatten_managed_grads()
+        )
         dist.all_reduce(flat, op=dist.ReduceOp.SUM, group=self.process_group, async_op=False)
         flat.div_(self._world_size)
         self._unflatten_grads_into_parameters(flat)
 
+    def _flatten_grad_tensors(
+        self, grads: tuple[torch.Tensor | None, ...]
+    ) -> torch.Tensor:
+        chunks: list[torch.Tensor] = []
+        for (param_name, _param), grad in zip(self._managed_params, grads):
+            if grad is None:
+                raise RuntimeError(
+                    "NanoDDPV1: expected a gradient for every managed parameter; "
+                    f"got None for {param_name!r}."
+                )
+            chunks.append(grad.detach().reshape(-1))
+        return torch.cat(chunks, dim=0)
+
     def _flatten_managed_grads(self) -> torch.Tensor:
-        """Flatten managed grads into a 1-D tensor."""
+        """Flatten ``param.grad`` into a 1-D tensor (manual ``sync_gradients()``)."""
         chunks: list[torch.Tensor] = []
         for param_name, param in self._managed_params:
             g = param.grad
             if g is None:
                 raise RuntimeError(
-                    "NanoDDPV1: expected every managed parameter to have .grad after backward; "
+                    "NanoDDPV1: expected every managed parameter to have .grad; "
                     f"got None for {param_name!r}."
                 )
             chunks.append(g.detach().reshape(-1))
@@ -156,7 +181,10 @@ class NanoDDPV1(_NanoDDPBase):
         for _param_name, param in self._managed_params:
             n = param.numel()
             chunk = flat[offset : offset + n].view_as(param)
-            param.grad.copy_(chunk)
+            if param.grad is None:
+                param.grad = chunk.clone()
+            else:
+                param.grad.copy_(chunk)
             offset += n
 
 
