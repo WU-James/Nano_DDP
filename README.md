@@ -5,6 +5,8 @@
 Name: Wu Yongjin
 SID: 20564741
 
+Presentation: https://www.youtube.com/watch?v=q61mfdMXiAk
+
 This project is for **implementing Data Parallel LLM distributed training** by myself. The repo provides three incremental implementations (**NanoDDP V1 / V2 / V3**) in:
 
 - [`nano_ddp.py`](nano_ddp.py)
