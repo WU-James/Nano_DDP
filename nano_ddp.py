@@ -285,7 +285,7 @@ class NanoDDPV2(_NanoDDPBase):
                 param.grad.copy_(buf)
 
 
-_DEFAULT_BUCKET_SIZE_BYTES = 25 * 1024 * 1024
+_DEFAULT_BUCKET_SIZE_BYTES = 50 * 1024 * 1024
 
 
 class NanoDDPV3(_NanoDDPBase):
